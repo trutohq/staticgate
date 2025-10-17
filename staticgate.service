@@ -1,0 +1,21 @@
+[Unit]
+Description=StaticGate Reverse Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Environment=PORT=80
+EnvironmentFile=/etc/staticgate/.env
+WorkingDirectory=/root
+ExecStart=/usr/local/bin/staticgate
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=staticgate
+
+[Install]
+WantedBy=multi-user.target
+
+
