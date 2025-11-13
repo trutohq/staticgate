@@ -83,6 +83,110 @@ func validateTokenHeader(r *http.Request, expected string) bool {
 	return isValid
 }
 
+// doRequestWithRedirects is a generic redirect handler:
+// - Works for all methods.
+// - Replays bodies safely using bodyBytes.
+// - Implements browser-like semantics for 301/302/303 vs 307/308.
+// - Detects simple URL loops and caps total redirects.
+func doRequestWithRedirects(
+	ctx context.Context,
+	client *http.Client,
+	method string,
+	startURL *url.URL,
+	headers http.Header,
+	bodyBytes []byte,
+	maxRedirects int,
+) (*http.Response, *url.URL, error) {
+
+	currentMethod := method
+	currentURL := startURL
+	visited := make(map[string]struct{})
+
+	for i := 0; i <= maxRedirects; i++ {
+		// Build body for this attempt
+		var body io.ReadCloser
+		if len(bodyBytes) > 0 && currentMethod != http.MethodGet && currentMethod != http.MethodHead {
+			body = io.NopCloser(bytes.NewReader(bodyBytes))
+		} else {
+			body = nil
+		}
+
+		req, err := http.NewRequestWithContext(ctx, currentMethod, currentURL.String(), body)
+		if err != nil {
+			return nil, currentURL, err
+		}
+		// Clone headers
+		req.Header = headers.Clone()
+		sanitizeHeaders(req.Header)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, currentURL, err
+		}
+
+		// If not a redirect or no Location header, we are done.
+		if resp.StatusCode < 300 || resp.StatusCode > 399 {
+			return resp, currentURL, nil
+		}
+		loc := resp.Header.Get("Location")
+		if loc == "" {
+			// No Location, nothing to follow.
+			return resp, currentURL, nil
+		}
+
+		// Resolve next URL
+		locURL, err := url.Parse(loc)
+		if err != nil {
+			return resp, currentURL, nil
+		}
+		nextURL := currentURL.ResolveReference(locURL)
+
+		// Log redirect hop
+		logJSON(jsonLog{
+			Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+			Method:     currentMethod,
+			TargetURL:  currentURL.String() + " -> " + nextURL.String(),
+			StatusCode: resp.StatusCode,
+			Message:    "upstream redirect",
+		})
+
+		// Detect loop by URL
+		if _, seen := visited[nextURL.String()]; seen {
+			// We already visited this URL. Return the redirect response as-is.
+			return resp, nextURL, nil
+		}
+		visited[nextURL.String()] = struct{}{}
+
+		// Close intermediate response body before next hop
+		_ = resp.Body.Close()
+
+		// Decide next method/body semantics per status code.
+
+		switch resp.StatusCode {
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther:
+			// 301, 302, 303: browsers switch non-GET/HEAD to GET and drop body.
+			if currentMethod != http.MethodGet && currentMethod != http.MethodHead {
+				currentMethod = http.MethodGet
+				bodyBytes = nil
+			}
+		case http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+			// 307, 308: must preserve method and body per RFC.
+			// We already handle body replay via bodyBytes, so nothing to change.
+		default:
+			// Other 3xx: do nothing special.
+		}
+
+		currentURL = nextURL
+	}
+
+	// Too many redirects
+	return nil, currentURL, &url.Error{
+		Op:  currentMethod,
+		URL: currentURL.String(),
+		Err: io.EOF,
+	}
+}
+
 func forwardHandler(expectedToken string, httpClient *http.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -127,6 +231,7 @@ func forwardHandler(expectedToken string, httpClient *http.Client) http.HandlerF
 			})
 			return
 		}
+
 		targetURL, err := url.Parse(rawTarget)
 		if err != nil || !(targetURL.Scheme == "http" || targetURL.Scheme == "https") || targetURL.Host == "" {
 			duration := time.Since(start)
@@ -141,48 +246,42 @@ func forwardHandler(expectedToken string, httpClient *http.Client) http.HandlerF
 			return
 		}
 
-		// Read request body for reuse
+		// Read request body for reuse across potential redirects
 		var payload []byte
 		if r.Body != nil {
 			payload, _ = io.ReadAll(r.Body)
 			_ = r.Body.Close()
 		}
-		body := io.NopCloser(bytes.NewReader(payload))
 
-		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), body)
-		if err != nil {
-			duration := time.Since(start)
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "request build failed"})
-			logJSON(jsonLog{
-				Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
-				Method:     r.Method,
-				TargetURL:  targetURL.String(),
-				StatusCode: http.StatusBadGateway,
-				DurationMs: duration.Milliseconds(),
-				Error:      "request build failed",
-			})
-			return
-		}
-
-		// Copy headers except Truto-* prefixed headers
+		// Prepare headers for upstream (exclude Truto-* headers)
+		upstreamHeaders := make(http.Header)
 		for k, vals := range r.Header {
-			if strings.HasPrefix(strings.ToLower(k), "truto-") {
+			lk := strings.ToLower(k)
+			if strings.HasPrefix(lk, "truto-") {
 				continue
 			}
 			for _, v := range vals {
-				outReq.Header.Add(k, v)
+				upstreamHeaders.Add(k, v)
 			}
 		}
-		sanitizeHeaders(outReq.Header)
+		sanitizeHeaders(upstreamHeaders)
 
-		resp, err := httpClient.Do(outReq)
+		resp, finalURL, err := doRequestWithRedirects(
+			r.Context(),
+			httpClient,
+			r.Method,
+			targetURL,
+			upstreamHeaders,
+			payload,
+			10, // maxRedirects
+		)
 		duration := time.Since(start)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream request error"})
 			logJSON(jsonLog{
 				Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
 				Method:     r.Method,
-				TargetURL:  targetURL.String(),
+				TargetURL:  finalURL.String(),
 				StatusCode: http.StatusBadGateway,
 				DurationMs: duration.Milliseconds(),
 				Error:      err.Error(),
@@ -207,7 +306,7 @@ func forwardHandler(expectedToken string, httpClient *http.Client) http.HandlerF
 		logJSON(jsonLog{
 			Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
 			Method:     r.Method,
-			TargetURL:  targetURL.String(),
+			TargetURL:  finalURL.String(),
 			StatusCode: resp.StatusCode,
 			DurationMs: duration.Milliseconds(),
 		})
@@ -244,9 +343,13 @@ func main() {
 		Error:     "API key: " + maskedApiKey + ", port: " + port,
 	})
 
+	httpClient := &http.Client{
+		Timeout: 60 * time.Second,
+	}
+
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           http.TimeoutHandler(http.HandlerFunc(forwardHandler(apiKey, &http.Client{Timeout: 60 * time.Second})), 120*time.Second, "upstream timeout"),
+		Handler:           http.HandlerFunc(forwardHandler(apiKey, httpClient)),
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 30 * time.Second,
 		WriteTimeout:      120 * time.Second,
@@ -258,7 +361,7 @@ func main() {
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		logJSON(jsonLog{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Message: "staticgate starting", TargetURL: "", StatusCode: 0})
+		logJSON(jsonLog{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Message: "staticgate starting"})
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logJSON(jsonLog{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Error: err.Error(), Message: "server error"})
 		}
