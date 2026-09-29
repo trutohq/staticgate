@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -23,6 +26,56 @@ type jsonLog struct {
 	DurationMs int64  `json:"duration_ms,omitempty"`
 	Error      string `json:"error,omitempty"`
 	Message    string `json:"message,omitempty"`
+}
+
+// errBlockedTarget is returned at dial time when a connection would go to a
+// non-public address. Checking at dial time (on the already-resolved IP)
+// covers DNS rebinding and redirects to internal hosts.
+var errBlockedTarget = errors.New("target not allowed")
+
+// Ranges that netip's IsLoopback/IsPrivate/IsLinkLocal*/IsMulticast/IsUnspecified do not cover.
+var blockedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"), // CGNAT
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),  // reserved + broadcast
+	netip.MustParsePrefix("64:ff9b::/96"), // NAT64, can embed private IPv4
+}
+
+// isBlockedIP reports whether ip is not a public unicast address.
+func isBlockedIP(ip netip.Addr) bool {
+	ip = ip.Unmap() // ::ffff:10.0.0.1 -> 10.0.0.1
+	if !ip.IsValid() || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	for _, p := range blockedPrefixes {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// guardDial is a net.Dialer.Control func; address is the resolved "ip:port".
+func guardDial(_, address string, _ syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil || isBlockedIP(ap.Addr()) {
+		return errBlockedTarget // fail closed on parse errors too
+	}
+	return nil
+}
+
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil // never route through env proxies
+	t.DialContext = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   guardDial,
+	}).DialContext
+	return t
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -276,6 +329,18 @@ func forwardHandler(expectedToken string, httpClient *http.Client) http.HandlerF
 			10, // maxRedirects
 		)
 		duration := time.Since(start)
+		if errors.Is(err, errBlockedTarget) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "target not allowed"})
+			logJSON(jsonLog{
+				Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+				Method:     r.Method,
+				TargetURL:  finalURL.String(),
+				StatusCode: http.StatusForbidden,
+				DurationMs: duration.Milliseconds(),
+				Error:      "target not allowed",
+			})
+			return
+		}
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream request error"})
 			logJSON(jsonLog{
@@ -344,7 +409,8 @@ func main() {
 	})
 
 	httpClient := &http.Client{
-		Timeout: 60 * time.Second,
+		Timeout:   60 * time.Second,
+		Transport: newTransport(),
 	}
 
 	srv := &http.Server{

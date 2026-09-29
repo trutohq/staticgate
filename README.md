@@ -99,6 +99,7 @@ echo "STATICGATE_API_KEY=your-secret-key-here" > .env
 Notes
 
 - Removes hop-by-hop headers; forwards all headers except `Truto-*` prefixed headers.
+- Blocks targets that resolve to non-public IPs (loopback, private, link-local incl. cloud metadata 169.254.169.254, CGNAT, reserved) at dial time, including via redirects and DNS rebinding; responds `403 {"error":"target not allowed"}`.
 - Logs requests in JSON with timing and status.
 - Service runs on port 80 by default (requires root or CAP_NET_BIND_SERVICE capability).
 - Environment file location: `/etc/staticgate/.env`
