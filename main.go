@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +27,112 @@ type jsonLog struct {
 	DurationMs int64  `json:"duration_ms,omitempty"`
 	Error      string `json:"error,omitempty"`
 	Message    string `json:"message,omitempty"`
+}
+
+// errBlockedTarget is returned at dial time (enforce mode only) when a
+// connection would go to a blocked address. Checking at dial time (on the
+// already-resolved IP) covers DNS rebinding and redirects to internal hosts.
+var errBlockedTarget = errors.New("target not allowed")
+
+// Tier 1 (always blocked): no legitimate use through a public-egress proxy.
+// Loopback is the gate itself; link-local is only cloud metadata (169.254.169.254).
+// netip covers loopback, link-local unicast/multicast and unspecified; this adds 0.0.0.0/8.
+var alwaysBlockedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+}
+
+// Tier 2 (only with STATICGATE_BLOCK_PRIVATE_NETWORKS=true): internal ranges
+// that netip's IsPrivate/IsMulticast do not fully cover.
+var privateBlockedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"), // CGNAT
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),  // reserved + broadcast
+	netip.MustParsePrefix("64:ff9b::/96"), // NAT64, can embed private IPv4
+}
+
+// isAlwaysBlockedIP reports tier 1: loopback, link-local, unspecified, 0/8.
+func isAlwaysBlockedIP(ip netip.Addr) bool {
+	ip = ip.Unmap() // ::ffff:127.0.0.1 -> 127.0.0.1
+	if !ip.IsValid() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	for _, p := range alwaysBlockedPrefixes {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPrivateBlockedIP reports tier 2: RFC1918, ULA, CGNAT, multicast, reserved, NAT64.
+func isPrivateBlockedIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if ip.IsPrivate() || ip.IsMulticast() {
+		return true
+	}
+	for _, p := range privateBlockedPrefixes {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// guardConfig controls the dial-time target guard.
+type guardConfig struct {
+	enforce      bool // false = log only ("would block target"), true = refuse with 403
+	blockPrivate bool // also apply tier 2
+}
+
+func guardConfigFromEnv() guardConfig {
+	return guardConfig{
+		enforce:      strings.EqualFold(getEnv("STATICGATE_BLOCK_MODE", "log"), "enforce"),
+		blockPrivate: strings.EqualFold(getEnv("STATICGATE_BLOCK_PRIVATE_NETWORKS", "false"), "true"),
+	}
+}
+
+// blocked reports whether ip falls in a range this config blocks.
+func (g guardConfig) blocked(ip netip.Addr) bool {
+	return isAlwaysBlockedIP(ip) || (g.blockPrivate && isPrivateBlockedIP(ip))
+}
+
+type dialHostKey struct{}
+
+// control is a net.Dialer.ControlContext func; address is the resolved "ip:port".
+// In log mode a would-be-blocked dial is allowed and logged; in enforce mode it fails.
+func (g guardConfig) control(ctx context.Context, _, address string, _ syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err == nil && !g.blocked(ap.Addr()) {
+		return nil
+	}
+	if !g.enforce {
+		host, _ := ctx.Value(dialHostKey{}).(string)
+		logJSON(jsonLog{
+			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			TargetURL: host,
+			Message:   "would block target",
+			Error:     "resolved address: " + address,
+		})
+		return nil
+	}
+	return errBlockedTarget // fail closed on parse errors too
+}
+
+// newTransport is a clone of http.DefaultTransport (proxy from env, timeouts,
+// HTTP/2, idle conns all unchanged). The only difference is the dial guard.
+func newTransport(g guardConfig) *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	d := &net.Dialer{
+		Timeout:        30 * time.Second, // same as DefaultTransport
+		KeepAlive:      30 * time.Second, // same as DefaultTransport
+		ControlContext: g.control,
+	}
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return d.DialContext(context.WithValue(ctx, dialHostKey{}, addr), network, addr)
+	}
+	return t
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -276,6 +386,18 @@ func forwardHandler(expectedToken string, httpClient *http.Client) http.HandlerF
 			10, // maxRedirects
 		)
 		duration := time.Since(start)
+		if errors.Is(err, errBlockedTarget) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "target not allowed"})
+			logJSON(jsonLog{
+				Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+				Method:     r.Method,
+				TargetURL:  finalURL.String(),
+				StatusCode: http.StatusForbidden,
+				DurationMs: duration.Milliseconds(),
+				Error:      "target not allowed",
+			})
+			return
+		}
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream request error"})
 			logJSON(jsonLog{
@@ -343,8 +465,20 @@ func main() {
 		Error:     "API key: " + maskedApiKey + ", port: " + port,
 	})
 
+	guard := guardConfigFromEnv()
+	mode := "log"
+	if guard.enforce {
+		mode = "enforce"
+	}
+	logJSON(jsonLog{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Message:   "target guard",
+		Error:     "mode: " + mode + ", block private networks: " + strconv.FormatBool(guard.blockPrivate),
+	})
+
 	httpClient := &http.Client{
-		Timeout: 60 * time.Second,
+		Timeout:   60 * time.Second,
+		Transport: newTransport(guard),
 	}
 
 	srv := &http.Server{
